@@ -27,7 +27,7 @@ import (
 	"github.com/meshplus/bitxhub-model/pb"
 )
 
-//go:generate abigen --sol ./example/broker.sol --pkg main --out broker.go
+//go:generate abigen --sol ./example/benchmark/broker.sol --pkg main --out broker.go
 //go:generate abigen --sol ./example/broker_direct.sol --pkg main --out broker_direct.go
 type Client struct {
 	abi           abi.ABI
@@ -363,9 +363,39 @@ func (c *Client) SubmitIBTPBatch(from []string, index []uint64, serviceID []stri
 
 	return ret, nil
 }
+func (c *Client) SubmitReceiptBatch(tos []string, indexs []uint64, serviceIDs []string, ibtpTypes []pb.IBTP_Type, batchResult []*pb.Result, proofs []*pb.BxhProof) (*pb.SubmitIBTPResponse, error) {
+	ret := &pb.SubmitIBTPResponse{Status: true}
+	batchResults := make([][][][]byte, 0)
+	for _, result := range batchResult {
+		var results [][][]byte
+		for _, s := range result.Data {
+			results = append(results, s.Data)
+		}
+		batchResults = append(batchResults, results)
+	}
+	ibtpTyps := make([]uint64, 0)
+	for _, ibtpType := range ibtpTypes {
+		ibtpTyps = append(ibtpTyps, uint64(ibtpType))
+	}
 
-func (c *Client) SubmitReceiptBatch(_ []string, _ []uint64, _ []string, _ []pb.IBTP_Type, _ []*pb.Result, _ []*pb.BxhProof) (*pb.SubmitIBTPResponse, error) {
-	panic("implement me")
+	batchTxStatus := make([]uint64, 0)
+	multiSigns := make([][][]byte, 0)
+	for _, proof := range proofs {
+		batchTxStatus = append(batchTxStatus, uint64(proof.TxStatus))
+		multiSigns = append(multiSigns, proof.MultiSign)
+	}
+
+	// The case where a rollback is required in the source chain of a single transaction
+	receipt, err := c.invokeReceipts(serviceIDs, tos, indexs, ibtpTyps, batchResults, batchTxStatus, multiSigns)
+	if err != nil {
+		ret.Status = false
+		ret.Message = err.Error()
+		logger.Warn("SubmitReceipts:", ret.Status, ret.Message)
+		return ret, nil
+	}
+
+	logger.Info("txHash: ", receipt.TxHash)
+	return ret, nil
 }
 
 //nolint:dupl
@@ -506,6 +536,40 @@ func (c *Client) invokeReceipt(srcAddr string, dstFullID string, index uint64, r
 				logger.Warn("multiSign", strconv.Itoa(i), hexutil.Encode(sign))
 			}
 
+			if strings.Contains(txErr.Error(), "execution reverted") {
+				return nil
+			}
+		}
+
+		return txErr
+	}, strategy.Wait(2*time.Second)); err != nil {
+		logger.Error("Can't invoke contract", "error", err)
+	}
+	c.lock.Unlock()
+	if txErr != nil {
+		return nil, txErr
+	}
+
+	return c.waitForConfirmed(tx.Hash()), nil
+}
+
+func (c *Client) invokeReceipts(srcAddrs []string, dstFullIDs []string, indexs []uint64, reqTypes []uint64,
+	batchResults [][][][]byte, batchTxStatus []uint64, batchMultiSign [][][]byte) (*types.Receipt, error) {
+
+	c.lock.Lock()
+	var tx *types.Transaction
+	var txErr error
+	if err := retry.Retry(func(attempt uint) error {
+		if c.session == nil {
+			txErr = fmt.Errorf("direct mode is not support invokeReceipts")
+			return nil
+		} else {
+			tx, txErr = c.session.InvokeReceipts(srcAddrs, dstFullIDs, indexs, reqTypes, batchResults, batchTxStatus, batchMultiSign)
+		}
+		if txErr != nil {
+			logger.Warn("Call InvokeReceipts failed",
+				"error", txErr.Error(),
+			)
 			if strings.Contains(txErr.Error(), "execution reverted") {
 				return nil
 			}
